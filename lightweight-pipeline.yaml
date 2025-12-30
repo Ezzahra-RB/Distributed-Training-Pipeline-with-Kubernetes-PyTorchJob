@@ -1,0 +1,468 @@
+# Pipeline MLOps ultra-léger - SANS MLflow
+# Tous les artefacts vont dans MinIO uniquement
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mlops-light
+
+---
+# MinIO uniquement (pas de PostgreSQL, pas de MLflow)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-pvc
+  namespace: mlops-light
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: mlops-light
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+      - name: minio
+        image: minio/minio:RELEASE.2023-09-04T19-57-37Z
+        args:
+        - server
+        - /data
+        - --console-address
+        - ":9001"
+        env:
+        - name: MINIO_ROOT_USER
+          value: "minioadmin"
+        - name: MINIO_ROOT_PASSWORD
+          value: "minioadmin"
+        ports:
+        - containerPort: 9000
+        - containerPort: 9001
+        volumeMounts:
+        - name: storage
+          mountPath: /data
+        resources:
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+      volumes:
+      - name: storage
+        persistentVolumeClaim:
+          claimName: minio-pvc
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: mlops-light
+spec:
+  type: ClusterIP
+  ports:
+  - port: 9000
+    targetPort: 9000
+    name: api
+  - port: 9001
+    targetPort: 9001
+    name: console
+  selector:
+    app: minio
+
+---
+# Code d'entraînement simplifié
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: training-code-light
+  namespace: mlops-light
+data:
+  train.py: |
+    import os
+    import torch
+    import torch.nn as nn
+    import torch.distributed as dist
+    import torchvision
+    import torchvision.transforms as transforms
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    from torch.utils.data.distributed import DistributedSampler
+    import json
+    from datetime import datetime
+    from minio import Minio
+    
+    def setup_distributed():
+        rank = int(os.environ.get("RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        
+        if world_size > 1:
+            dist.init_process_group(
+                backend='gloo',
+                init_method=f'tcp://{os.environ.get("MASTER_ADDR", "localhost")}:{os.environ.get("MASTER_PORT", "23456")}',
+                world_size=world_size,
+                rank=rank
+            )
+        return rank, world_size
+    
+    def setup_minio():
+        try:
+            client = Minio(
+                "minio.mlops-light.svc.cluster.local:9000",
+                access_key="minioadmin",
+                secret_key="minioadmin",
+                secure=False
+            )
+            
+            for bucket in ["datasets", "models", "metrics"]:
+                if not client.bucket_exists(bucket):
+                    client.make_bucket(bucket)
+                    print(f"✓ Bucket '{bucket}' créé")
+            
+            return client
+        except Exception as e:
+            print(f"⚠️  MinIO: {e}")
+            return None
+    
+    def main():
+        rank, world_size = setup_distributed()
+        print(f"\n{'='*60}")
+        print(f"[Rank {rank}/{world_size}] 🚀 DÉMARRAGE ENTRAÎNEMENT DISTRIBUÉ")
+        print(f"{'='*60}\n")
+        
+        # Setup MinIO (rank 0 uniquement)
+        minio_client = setup_minio() if rank == 0 else None
+        
+        device = torch.device('cpu')
+        
+        # Transformations
+        transform_train = transforms.Compose([
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomCrop(32, padding=4),
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+        ])
+        
+        transform_test = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+        ])
+        
+        # === ÉTAPE 1: DATA INGESTION ===
+        print(f"[Rank {rank}] 📥 ÉTAPE 1/5: Data Ingestion")
+        trainset = torchvision.datasets.CIFAR10(
+            root='/data', train=True, download=True, transform=transform_train
+        )
+        testset = torchvision.datasets.CIFAR10(
+            root='/data', train=False, download=True, transform=transform_test
+        )
+        print(f"[Rank {rank}] ✓ {len(trainset)} train, {len(testset)} test\n")
+        # AJOUTER CE CODE (uniquement pour rank 0) :
+        if rank == 0 and minio_client:
+            import pickle
+            print("[Rank 0] 💾 Upload des datasets vers MinIO...")
+            
+            # Sauvegarder localement
+            with open('/tmp/train.pkl', 'wb') as f:
+                pickle.dump(trainset, f)
+            with open('/tmp/test.pkl', 'wb') as f:
+                pickle.dump(testset, f)
+            
+            # Upload vers MinIO
+            try:
+                minio_client.fput_object("datasets", "cifar10_train.pkl", "/tmp/train.pkl")
+                minio_client.fput_object("datasets", "cifar10_test.pkl", "/tmp/test.pkl")
+                print("[Rank 0] ✓ Datasets uploadés dans MinIO")
+            except Exception as e:
+                print(f"[Rank 0] ⚠️  Upload datasets: {e}")
+
+        # === ÉTAPE 2: FEATURE ENGINEERING ===
+        print(f"[Rank {rank}] 🔧 ÉTAPE 2/5: Feature Engineering")
+        train_sampler = DistributedSampler(
+            trainset, num_replicas=world_size, rank=rank, shuffle=True
+        ) if world_size > 1 else None
+        
+        trainloader = torch.utils.data.DataLoader(
+            trainset, batch_size=128, sampler=train_sampler,
+            num_workers=2, pin_memory=False, shuffle=(train_sampler is None)
+        )
+        
+        testloader = torch.utils.data.DataLoader(
+            testset, batch_size=100, shuffle=False, num_workers=2
+        )
+        print(f"[Rank {rank}] ✓ DataLoaders configurés\n")
+        
+        # === ÉTAPE 3: DISTRIBUTED TRAINING ===
+        print(f"[Rank {rank}] 🏗️  ÉTAPE 3/5: Model Creation")
+        model = torchvision.models.resnet18(weights=None)
+        model.fc = nn.Linear(model.fc.in_features, 10)
+        model = model.to(device)
+        
+        if world_size > 1:
+            model = DDP(model)
+        
+        criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
+        
+        print(f"[Rank {rank}] ✓ ResNet-18 créé\n")
+        
+        # Métriques
+        metrics = {
+            "epochs": [], "train_loss": [], "train_acc": [],
+            "test_loss": [], "test_acc": []
+        }
+        
+        print(f"[Rank {rank}] 🎯 Entraînement 10 epochs...\n")
+        
+        for epoch in range(10):
+            if train_sampler:
+                train_sampler.set_epoch(epoch)
+            
+            # Training
+            model.train()
+            train_loss, correct, total = 0, 0, 0
+            
+            for batch_idx, (inputs, targets) in enumerate(trainloader):
+                inputs, targets = inputs.to(device), targets.to(device)
+                
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                loss.backward()
+                optimizer.step()
+                
+                train_loss += loss.item()
+                _, predicted = outputs.max(1)
+                total += targets.size(0)
+                correct += predicted.eq(targets).sum().item()
+                
+                if batch_idx % 50 == 0 and rank == 0:
+                    print(f'  Epoch {epoch+1}/10 [{batch_idx}/{len(trainloader)}] '
+                          f'Loss: {train_loss/(batch_idx+1):.3f} '
+                          f'Acc: {100.*correct/total:.2f}%')
+            
+            train_acc = 100. * correct / total
+            train_loss = train_loss / len(trainloader)
+            
+            # === ÉTAPE 4: EVALUATION ===
+            if rank == 0:
+                model.eval()
+                test_loss, correct, total = 0, 0, 0
+                
+                with torch.no_grad():
+                    for inputs, targets in testloader:
+                        inputs, targets = inputs.to(device), targets.to(device)
+                        outputs = model(inputs)
+                        loss = criterion(outputs, targets)
+                        
+                        test_loss += loss.item()
+                        _, predicted = outputs.max(1)
+                        total += targets.size(0)
+                        correct += predicted.eq(targets).sum().item()
+                
+                test_acc = 100. * correct / total
+                test_loss = test_loss / len(testloader)
+                
+                metrics["epochs"].append(epoch + 1)
+                metrics["train_loss"].append(train_loss)
+                metrics["train_acc"].append(train_acc)
+                metrics["test_loss"].append(test_loss)
+                metrics["test_acc"].append(test_acc)
+                
+                print(f'\n📊 Epoch {epoch+1}/10:')
+                print(f'   Train: Loss={train_loss:.3f}, Acc={train_acc:.2f}%')
+                print(f'   Test:  Loss={test_loss:.3f}, Acc={test_acc:.2f}%\n')
+                
+                # Sauvegarder checkpoint
+                checkpoint_path = f'/output/checkpoint_epoch_{epoch+1}.pth'
+                torch.save({
+                    'epoch': epoch + 1,
+                    'model_state_dict': model.module.state_dict() if world_size > 1 else model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'metrics': metrics
+                }, checkpoint_path)
+                
+                # Upload vers MinIO
+                if minio_client:
+                    try:
+                        minio_client.fput_object(
+                            "models",
+                            f"resnet-cifar10/checkpoint_epoch_{epoch+1}.pth",
+                            checkpoint_path
+                        )
+                        print(f"💾 Checkpoint epoch {epoch+1} → MinIO")
+                    except Exception as e:
+                        print(f"⚠️  Upload: {e}")
+            
+            scheduler.step()
+        
+        # === ÉTAPE 5: VERSIONING ===
+        if rank == 0:
+            print(f"\n{'='*60}")
+            print(f"🎉 ENTRAÎNEMENT TERMINÉ!")
+            print(f"{'='*60}\n")
+            print(f"📈 Résultats finaux:")
+            print(f"   Best Train Acc: {max(metrics['train_acc']):.2f}%")
+            print(f"   Best Test Acc: {max(metrics['test_acc']):.2f}%\n")
+            
+            # Sauvegarder modèle final
+            model_to_save = model.module if world_size > 1 else model
+            final_model_path = '/output/resnet_cifar10_final.pth'
+            
+            torch.save({
+                'model_state_dict': model_to_save.state_dict(),
+                'metrics': metrics,
+                'timestamp': datetime.now().isoformat()
+            }, final_model_path)
+            
+            metrics_path = '/output/metrics.json'
+            with open(metrics_path, 'w') as f:
+                json.dump(metrics, f, indent=2)
+            
+            # Upload final vers MinIO
+            if minio_client:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                
+                minio_client.fput_object(
+                    "models",
+                    f"resnet-cifar10/model_v{timestamp}.pth",
+                    final_model_path
+                )
+                minio_client.fput_object(
+                    "models",
+                    "resnet-cifar10/model_latest.pth",
+                    final_model_path
+                )
+                minio_client.fput_object(
+                    "metrics",
+                    f"resnet-cifar10/metrics_v{timestamp}.json",
+                    metrics_path
+                )
+                
+                print(f"☁️  Modèle final v{timestamp} → MinIO")
+                print(f"☁️  Métriques → MinIO\n")
+        
+        if world_size > 1:
+            dist.destroy_process_group()
+        
+        print(f"[Rank {rank}] ✅ TERMINÉ!\n")
+    
+    if __name__ == '__main__':
+        try:
+            main()
+        except Exception as e:
+            print(f"❌ ERREUR: {e}")
+            import traceback
+            traceback.print_exc()
+            exit(1)
+
+---
+# PVC
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: training-output
+  namespace: mlops-light
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 3Gi
+
+---
+# PyTorchJob avec ressources RÉDUITES
+apiVersion: kubeflow.org/v1
+kind: PyTorchJob
+metadata:
+  name: resnet-light
+  namespace: mlops-light
+spec:
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: OnFailure
+      template:
+        spec:
+          containers:
+          - name: pytorch
+            image: pytorch/pytorch:2.0.0-cuda11.7-cudnn8-runtime
+            command:
+            - bash
+            - -c
+            - |
+              pip install minio
+              python /workspace/train.py
+            volumeMounts:
+            - name: training-code
+              mountPath: /workspace
+            - name: training-output
+              mountPath: /output
+            - name: data-cache
+              mountPath: /data
+            resources:
+              limits:
+                memory: "2Gi"
+                cpu: "1000m"
+              requests:
+                memory: "1Gi"
+                cpu: "500m"
+          volumes:
+          - name: training-code
+            configMap:
+              name: training-code-light
+          - name: training-output
+            persistentVolumeClaim:
+              claimName: training-output
+          - name: data-cache
+            emptyDir: {}
+    
+    Worker:
+      replicas: 1
+      restartPolicy: OnFailure
+      template:
+        spec:
+          containers:
+          - name: pytorch
+            image: pytorch/pytorch:2.0.0-cuda11.7-cudnn8-runtime
+            command:
+            - bash
+            - -c
+            - |
+              pip install minio
+              python /workspace/train.py
+            volumeMounts:
+            - name: training-code
+              mountPath: /workspace
+            - name: data-cache
+              mountPath: /data
+            resources:
+              limits:
+                memory: "2Gi"
+                cpu: "1000m"
+              requests:
+                memory: "1Gi"
+                cpu: "500m"
+          volumes:
+          - name: training-code
+            configMap:
+              name: training-code-light
+          - name: data-cache
+            emptyDir: {}
