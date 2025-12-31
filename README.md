@@ -561,6 +561,7 @@ kubectl logs -f -l training.kubeflow.org/job-name=resnet-light,training.kubeflow
 # Port-forwarding
 kubectl port-forward -n mlops-light svc/minio 9001:9001
 ```
+![minio home](images/minio.png)
 
 Puis ouvrir dans le navigateur : **http://localhost:9001**
 
