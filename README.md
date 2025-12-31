@@ -47,38 +47,7 @@ Ce projet implémente un **pipeline MLOps complet** pour l'entraînement distrib
 
 ## 🏗️ Architecture
 
-```
-┌─────────────────────────────────────────────┐
-│         Kubernetes Cluster (Minikube)       │
-├─────────────────────────────────────────────┤
-│                                             │
-│  ┌──────────────────────────────┐          │
-│  │          MinIO               │          │
-│  │    (S3-Compatible Storage)   │          │
-│  │                              │          │
-│  │  Buckets:                    │          │
-│  │  • datasets/  (CIFAR-10)     │          │
-│  │  • models/    (Checkpoints)  │          │
-│  │  • metrics/   (JSON logs)    │          │
-│  └──────────────────────────────┘          │
-│                  ↑                          │
-│                  │                          │
-│  ┌───────────────┴────────────────┐        │
-│  │      PyTorchJob (DDP)          │        │
-│  │                                 │        │
-│  │  ┌──────────┐    ┌──────────┐  │        │
-│  │  │  Master  │    │  Worker  │  │        │
-│  │  │  (Rank 0)│◄──►│  (Rank 1)│  │        │
-│  │  │          │    │          │  │        │
-│  │  │ ResNet-18│    │ ResNet-18│  │        │
-│  │  │ Training │    │ Training │  │        │
-│  │  └──────────┘    └──────────┘  │        │
-│  │                                 │        │
-│  │  Communication: TCP (gloo)      │        │
-│  └─────────────────────────────────┘        │
-│                                             │
-└─────────────────────────────────────────────┘
-```
+![Architecture globale](images/Architecture.png)
 
 ### 🔧 Technologies Utilisées
 
@@ -363,10 +332,6 @@ Logs en temps réel:
 ...
 ```
 
-**Durée totale** : ~25-35 minutes
-- Setup : 2-3 min
-- Entraînement : 20-30 min
-
 ---
 
 ## 📊 Pipeline MLOps
@@ -490,26 +455,15 @@ metrics/
 
 | Epoch | Train Loss | Train Acc | Test Loss | Test Acc |
 |-------|------------|-----------|-----------|----------|
-| 1 | 1.875 | 31.2% | 1.652 | 39.8% |
+| 1 | 2.168 | 29.70% | 1.63 | 39.00% |
 | 2 | 1.512 | 45.6% | 1.398 | 50.2% |
-| 5 | 0.983 | 65.4% | 0.945 | 67.1% |
-| 10 | 0.421 | 85.3% | 0.682 | 78.5% |
+| 5 | 1.058 | 62.06% | 1.025 | 63.32% |
+| 10 | 0.421 | 73.43% | 0.748 | 78.5% |
 
 **Graphiques** :
 
-```
-Train vs Test Accuracy
-90% ┤                                    ╭──
-80% ┤                           ╭────────╯
-70% ┤                    ╭──────╯
-60% ┤              ╭─────╯
-50% ┤        ╭─────╯
-40% ┤   ╭────╯
-30% ┼───╯
-    └─────────────────────────────────────
-    1   2   3   4   5   6   7   8   9   10
-                    Epochs
-```
+![Train vs Test Accuracy](images/metrics.png)
+
 
 ### Temps d'Exécution
 
@@ -517,9 +471,9 @@ Train vs Test Accuracy
 |-------|-------|-------------|
 | Setup | 2-3 min | Déploiement MinIO, création buckets |
 | Data Download | 1-2 min | CIFAR-10 download (première fois) |
-| Training | 20-25 min | 10 epochs complets |
+| Training | 4–5 h | 10 epochs complets |
 | Saving | 1-2 min | Upload vers MinIO |
-| **Total** | **25-30 min** | Pipeline complet |
+| **Total** | **4h :4min– 5h :7min** | Pipeline complet |
 
 ### Utilisation Ressources
 
@@ -528,11 +482,6 @@ Train vs Test Accuracy
 kubectl top nodes
 kubectl top pods -n mlops-light
 ```
-
-**Ressources typiques** :
-- Master : ~1.5 GB RAM, 80% CPU
-- Worker : ~1.5 GB RAM, 80% CPU
-- MinIO : ~250 MB RAM, 10% CPU
 
 ---
 
@@ -631,40 +580,7 @@ Puis ouvrir dans le navigateur : **http://localhost:9001**
 # Télécharger les métriques
 kubectl port-forward -n mlops-light svc/minio 9000:9000 &
 
-# Script Python pour visualiser
-python3 << 'EOF'
-from minio import Minio
-import json
-import tempfile
-
-client = Minio("localhost:9000", access_key="minioadmin", secret_key="minioadmin", secure=False)
-
-# Liste des fichiers de métriques
-objects = list(client.list_objects("metrics", prefix="resnet-cifar10/", recursive=True))
-
-if objects:
-    # Télécharger le plus récent
-    latest = sorted(objects, key=lambda x: x.last_modified, reverse=True)[0]
-    
-    with tempfile.NamedTemporaryFile(mode='w+b', delete=False) as tmp:
-        client.fget_object("metrics", latest.object_name, tmp.name)
-        with open(tmp.name, 'r') as f:
-            metrics = json.load(f)
-    
-    print("\n" + "="*60)
-    print("           RÉSULTATS FINAUX")
-    print("="*60)
-    print(f"\n📊 Epochs: {len(metrics['epochs'])}")
-    print(f"\n🎯 Accuracy Finale:")
-    print(f"   Train: {metrics['train_acc'][-1]:.2f}%")
-    print(f"   Test:  {metrics['test_acc'][-1]:.2f}%")
-    print(f"\n📈 Meilleure Accuracy:")
-    print(f"   Train: {max(metrics['train_acc']):.2f}%")
-    print(f"   Test:  {max(metrics['test_acc']):.2f}%")
-else:
-    print("❌ Aucune métrique trouvée")
-EOF
-```
+![Train vs Test Accuracy](images/minio-metrics.png)
 
 ---
 
@@ -679,122 +595,8 @@ Une fois l'entraînement terminé, déployez une API REST pour faire des prédic
 ```bash
 nano deploy-inference.yaml
 ```
+Puis copier le contenu complet du fichier deploy-inference.yaml
 
-```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: inference-code
-  namespace: mlops-light
-data:
-  serve.py: |
-    from flask import Flask, request, jsonify
-    import torch
-    import torchvision
-    import torchvision.transforms as transforms
-    from PIL import Image
-    import io
-    from minio import Minio
-    
-    app = Flask(__name__)
-    
-    CLASSES = ['airplane', 'automobile', 'bird', 'cat', 'deer',
-               'dog', 'frog', 'horse', 'ship', 'truck']
-    
-    transform = transforms.Compose([
-        transforms.Resize(32),
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
-    ])
-    
-    def load_model():
-        client = Minio("minio.mlops-light.svc.cluster.local:9000",
-                      access_key="minioadmin", secret_key="minioadmin", secure=False)
-        
-        client.fget_object("models", "resnet-cifar10/model_latest.pth", "/tmp/model.pth")
-        
-        model = torchvision.models.resnet18(weights=None)
-        model.fc = torch.nn.Linear(model.fc.in_features, 10)
-        
-        checkpoint = torch.load("/tmp/model.pth", map_location='cpu')
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model.eval()
-        
-        return model
-    
-    model = load_model()
-    
-    @app.route('/predict', methods=['POST'])
-    def predict():
-        file = request.files['file']
-        img = Image.open(io.BytesIO(file.read())).convert('RGB')
-        img_tensor = transform(img).unsqueeze(0)
-        
-        with torch.no_grad():
-            outputs = model(img_tensor)
-            probs = torch.nn.functional.softmax(outputs, dim=1)
-            conf, pred = probs.max(1)
-        
-        return jsonify({
-            "prediction": CLASSES[pred.item()],
-            "confidence": float(conf.item())
-        })
-    
-    if __name__ == '__main__':
-        app.run(host='0.0.0.0', port=8080)
-
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: resnet-inference
-  namespace: mlops-light
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: inference
-  template:
-    metadata:
-      labels:
-        app: inference
-    spec:
-      containers:
-      - name: api
-        image: python:3.9
-        command:
-        - bash
-        - -c
-        - |
-          pip install flask torch torchvision minio pillow
-          python /app/serve.py
-        ports:
-        - containerPort: 8080
-        volumeMounts:
-        - name: code
-          mountPath: /app
-        resources:
-          limits:
-            memory: "1Gi"
-            cpu: "500m"
-      volumes:
-      - name: code
-        configMap:
-          name: inference-code
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: inference
-  namespace: mlops-light
-spec:
-  type: ClusterIP
-  ports:
-  - port: 8080
-    targetPort: 8080
-  selector:
-    app: inference
-```
 
 #### Déployer
 
@@ -823,6 +625,17 @@ curl -X POST -F "file=@test_image.png" http://localhost:8080/predict
 }
 ```
 
+---
+
+## Authors 
+- Ezzahra Ait El Arbi  
+- Zahira El Aamrani  
+- Hafssa Errami  
+
+Supervisor: *Fahd Kalloubi*  
+Faculty of Sciences Semlalia, Cadi Ayyad University, Marrakech
+
+---
 ---
 
 ## 🛠️ Troubleshooting
